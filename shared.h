@@ -1,0 +1,3 @@
+#define TASK_COMM_LEN	 16
+#define MAX_FILENAME_LEN 64
+#define MAX_PATTERN_LEN	 64

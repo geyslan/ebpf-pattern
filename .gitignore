@@ -3,7 +3,9 @@
 *.exe~
 *.dll
 *.so
+*.o
 *.dylib
+ebpf-pattern
 
 # Test binary, built with `go test -c`
 *.test
@@ -11,5 +13,12 @@
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
+# Dependency files
+*.d
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
+include/
+
+# Editor
+.vscode/
