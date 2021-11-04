@@ -7,22 +7,37 @@
 
 #include "shared.h"
 
+struct pattern_block_key {
+	char pattern_block[MAX_PATTERN_BLOCK_LEN];
+};
+
+struct pattern_block_value {
+	u32 mask; /* (length << 24) | (raw << 16) | (u16) ref_count */
+	u16 index;
+};
+
 struct pattern_key {
-	char pattern[MAX_PATTERN_LEN];
+	u32 pidns;
+	u32 mntns;
+	u16 pattern_block_indexes[MAX_PATTERN_BLOCKS];
 };
 
 struct pattern_value {
-	u8  length;
-	u8  blocks;
-	u64 stars;
-	u64 qmarks;
+	u16 raw;
 };
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct pattern_block_key);
+	__type(value, struct pattern_block_value);
+	__uint(max_entries, __UINT16_MAX__);
+} pattern_block_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct pattern_key);
 	__type(value, struct pattern_value);
-	__uint(max_entries, 1 << 10);
+	__uint(max_entries, __UINT16_MAX__);
 } pattern_map SEC(".maps");
 
 char LICENSE[] SEC("license") = "GPL";

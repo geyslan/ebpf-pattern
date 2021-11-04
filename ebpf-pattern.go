@@ -6,15 +6,34 @@ import "C"
 
 import (
 	"fmt"
-	"math"
 	"os"
+	"os/signal"
 	"unsafe"
 
 	lbpf "github.com/kubearmor/libbpf"
 )
 
-// PatternMaxLen constant
-const PatternMaxLen = int(C.MAX_PATTERN_LEN)
+// Constants
+const MaxPatternLen = int(C.MAX_PATTERN_LEN)
+const MaxPatternBlockLen = int(C.MAX_PATTERN_BLOCK_LEN)
+const MaxPatternBlocks = int(C.MAX_PATTERN_BLOCKS)
+
+// PatternBlockElement Structure
+type PatternBlockElement struct {
+	Key   PatternBlockKey
+	Value PatternBlockValue
+}
+
+// PatternBlockKey Structure
+type PatternBlockKey struct {
+	PatternBlock [MaxPatternBlockLen]byte
+}
+
+// PatternBlockValue Structure
+type PatternBlockValue struct {
+	Mask  uint32
+	Index uint16
+}
 
 // PatternElement Structure
 type PatternElement struct {
@@ -22,57 +41,91 @@ type PatternElement struct {
 	Value PatternValue
 }
 
-// PatternMapKey Structure
+// PatternKey Structure
 type PatternKey struct {
-	Pattern [PatternMaxLen]byte
+	PidNS               uint32
+	MntNS               uint32
+	PatternBlockIndexes [MaxPatternBlocks]uint16
 }
 
-// PatternMapValue Structure
+// PatternValue Structure
 type PatternValue struct {
-	Length     uint8
-	Blocks     uint8
-	StarsMask  uint64
-	QMarksMask uint64
+	Raw uint16
 }
 
-// SetKey Function (PatternElement)
-func (pme *PatternElement) SetKey(pattern string) {
-	copy(pme.Key.Pattern[:PatternMaxLen], pattern)
-	pme.Key.Pattern[PatternMaxLen-1] = 0
+// SetKey Function (PatternBlockElement)
+func (pbe *PatternBlockElement) SetKey(patternBlock string) {
+	copy(pbe.Key.PatternBlock[:MaxPatternBlockLen], patternBlock)
+	pbe.Key.PatternBlock[MaxPatternBlockLen-1] = 0
 }
 
-// SetValue Function (PatternElement)
-func (pme *PatternElement) SetValue(length, blocks uint8, starsMask, qmarksMask uint64) {
-	pme.Value.Length = length
-	pme.Value.Blocks = blocks
-	pme.Value.StarsMask = starsMask
-	pme.Value.QMarksMask = qmarksMask
+// SetValue Function (PatternBlockElement)
+func (pbe *PatternBlockElement) SetValue(mask uint32, index uint16) {
+	pbe.Value.Mask = mask
+	pbe.Value.Index = index
 }
 
-// SetFoundValue Function (PatternElement)
-func (pme *PatternElement) SetFoundValue(value []byte) {
-	pme.Value.Length = value[0]
-	pme.Value.Blocks = value[1]
-	pme.Value.StarsMask = getInt(value[2:10])
-	pme.Value.QMarksMask = getInt(value[10:18])
+// SetFoundValue Function (PatternBlockElement)
+func (pbe *PatternBlockElement) SetFoundValue(value []byte) {
+	pbe.Value.Mask = uint32(getInt(value[0:4]))
+	pbe.Value.Index = uint16(getInt(value[4:6]))
 }
 
-// KeyPointer Function (PatternElement)
-func (pme *PatternElement) KeyPointer() unsafe.Pointer {
+// KeyPointer Function (PatternBlockElement)
+func (pbe *PatternBlockElement) KeyPointer() unsafe.Pointer {
 	// #nosec
-	return unsafe.Pointer(&pme.Key)
+	return unsafe.Pointer(&pbe.Key)
 }
 
-// ValuePointer Function (PatternElement)
-func (pme *PatternElement) ValuePointer() unsafe.Pointer {
+// ValuePointer Function (PatternBlockElement)
+func (pbe *PatternBlockElement) ValuePointer() unsafe.Pointer {
 	// #nosec
-	return unsafe.Pointer(&pme.Value)
+	return unsafe.Pointer(&pbe.Value)
 }
 
-// MapName Function (PatternElement)
-func (pme *PatternElement) MapName() string {
-	return "pattern_map"
+// MapName Function (PatternBlockElement)
+func (pbe *PatternBlockElement) MapName() string {
+	return "pattern_block_map"
 }
+
+// // SetKey Function (PatternElement)
+// func (pme *PatternElement) SetKey(pattern string) {
+// 	copy(pme.Key.Pattern[:PatternMaxLen], pattern)
+// 	pme.Key.Pattern[PatternMaxLen-1] = 0
+// }
+
+// // SetValue Function (PatternElement)
+// func (pme *PatternElement) SetValue(length, blocks uint8, starsMask, qmarksMask uint64) {
+// 	pme.Value.Length = length
+// 	pme.Value.Blocks = blocks
+// 	pme.Value.StarsMask = starsMask
+// 	pme.Value.QMarksMask = qmarksMask
+// }
+
+// // SetFoundValue Function (PatternElement)
+// func (pme *PatternElement) SetFoundValue(value []byte) {
+// 	pme.Value.Length = value[0]
+// 	pme.Value.Blocks = value[1]
+// 	pme.Value.StarsMask = getInt(value[2:10])
+// 	pme.Value.QMarksMask = getInt(value[10:18])
+// }
+
+// // KeyPointer Function (PatternElement)
+// func (pme *PatternElement) KeyPointer() unsafe.Pointer {
+// 	// #nosec
+// 	return unsafe.Pointer(&pme.Key)
+// }
+
+// // ValuePointer Function (PatternElement)
+// func (pme *PatternElement) ValuePointer() unsafe.Pointer {
+// 	// #nosec
+// 	return unsafe.Pointer(&pme.Value)
+// }
+
+// // MapName Function (PatternElement)
+// func (pme *PatternElement) MapName() string {
+// 	return "pattern_map"
+// }
 
 func getInt(s []byte) uint64 {
 	var res uint64
@@ -128,30 +181,48 @@ func getPatternProperties(pattern string) (blocks int, stars, qmarks uint64) {
 	return blocks, stars, qmarks
 }
 
-func CalculatePatternValue(pattern string) *PatternValue {
-	patternLen := len(pattern)
-
-	if patternLen > math.MaxUint8 || patternLen > int(C.MAX_PATTERN_LEN) {
+func getPatternBlockKeys(pattern string) []PatternBlockKey {
+	if pattern == "" {
 		return nil
 	}
 
-	patternBlocks, patternStarsMask, patternQMarksMask := getPatternProperties(pattern)
-	if patternBlocks == 0 {
-		return nil
+	var blockIndexes []int
+	var lastRune rune
+	var result []PatternBlockKey
+
+	if pattern[0] != '/' {
+		blockIndexes = append(blockIndexes, 0)
 	}
 
-	return &PatternValue{
-		Length:     uint8(patternLen),
-		Blocks:     uint8(patternBlocks),
-		StarsMask:  uint64(patternStarsMask),
-		QMarksMask: uint64(patternQMarksMask),
+	for i, r := range pattern {
+		if r == lastRune {
+			continue
+		}
+		if r == '/' {
+			blockIndexes = append(blockIndexes, i)
+		}
 	}
+
+	if pattern[len(pattern)-1] != '/' {
+		blockIndexes = append(blockIndexes, len(pattern))
+	}
+
+	for i := 0; i < len(blockIndexes)-1; i++ {
+		var pbe PatternBlockElement
+		begin := blockIndexes[i]
+		end := blockIndexes[i+1]
+
+		pbe.SetKey(pattern[begin:end])
+		result = append(result, pbe.Key)
+	}
+
+	return result
 }
 
 func main() {
 	var err error
 	var o *lbpf.KABPFObject
-	var m *lbpf.KABPFMap
+	var pbmap *lbpf.KABPFMap
 
 	o, err = lbpf.OpenObjectFromFile("ebpf-pattern.bpf.o")
 	ExitIfErr(err)
@@ -160,27 +231,31 @@ func main() {
 	ExitIfErr(err)
 	defer o.Close()
 
-	m, err = o.FindMapByName("pattern_map")
+	pbmap, err = o.FindMapByName("pattern_block_map")
 	ExitIfErr(err)
 
-	err = m.Pin("/sys/fs/bpf/" + m.Name())
+	err = pbmap.Pin("/sys/fs/bpf/" + pbmap.Name())
 	ExitIfErr(err)
-	defer m.Unpin(m.Name())
+	defer pbmap.Unpin(pbmap.PinPath())
 
-	var patternElem PatternElement
+	// pattern := "/1****/2/////3????sh/4/5/6/7****///8/9????/10/11***/"
+	pattern := "/usr/bin/??sh"
 
-	pattern := "/1****/2/////3????sh/4/5/6/7****///8/9????/10/11***/"
+	res := getPatternBlockKeys(pattern)
 
-	var pv *PatternValue
+	for _, r := range res {
+		var patternBlockElem PatternBlockElement
 
-	pv = CalculatePatternValue(pattern)
-
-	patternElem.SetKey(pattern)
-	patternElem.SetValue(pv.Length, pv.Blocks, pv.StarsMask, pv.QMarksMask)
-	err = m.UpdateElement(&patternElem)
-	ExitIfErr(err)
-
-	for {
-		//
+		patternBlockElem.Key = r
+		err = pbmap.UpdateElement(&patternBlockElem)
+		ExitIfErr(err)
 	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+	}()
+	fmt.Printf("\n-> Do the map tests\n")
+	fmt.Printf("\n-> Caught sig %v!\n** Thanks for venturing into this design! **", <-c)
 }
