@@ -12,7 +12,7 @@ struct pattern_block_key {
 };
 
 struct pattern_block_value {
-	u32 mask; /* (length << 24) | (raw << 16) | (u16) ref_count */
+	u32 flags; /* (length << 24) | (kind << 16) | (u16) refcount */
 	u16 index;
 };
 
@@ -23,7 +23,7 @@ struct pattern_key {
 };
 
 struct pattern_value {
-	u16 raw;
+	u16 kind;
 };
 
 struct {

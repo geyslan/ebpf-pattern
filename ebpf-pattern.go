@@ -5,18 +5,31 @@ package main
 import "C"
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"unsafe"
 
 	lbpf "github.com/kubearmor/libbpf"
 )
 
 // Constants
-const MaxPatternLen = int(C.MAX_PATTERN_LEN)
-const MaxPatternBlockLen = int(C.MAX_PATTERN_BLOCK_LEN)
-const MaxPatternBlocks = int(C.MAX_PATTERN_BLOCKS)
+const (
+	MaxPatternLen      = int(C.MAX_PATTERN_LEN)
+	MaxPatternBlockLen = int(C.MAX_PATTERN_BLOCK_LEN)
+	MaxPatternBlocks   = int(C.MAX_PATTERN_BLOCKS)
+)
+
+const (
+	WildRawMask  uint8 = 0
+	WildStarMask       = 1 << (iota - 1)
+	WildQMarkMask
+)
 
 // PatternBlockElement Structure
 type PatternBlockElement struct {
@@ -31,7 +44,7 @@ type PatternBlockKey struct {
 
 // PatternBlockValue Structure
 type PatternBlockValue struct {
-	Mask  uint32
+	Flags uint32
 	Index uint16
 }
 
@@ -45,7 +58,7 @@ type PatternElement struct {
 type PatternKey struct {
 	PidNS               uint32
 	MntNS               uint32
-	PatternBlockIndexes [MaxPatternBlocks]uint16
+	PatternBlockOffsets [MaxPatternBlocks]uint16
 }
 
 // PatternValue Structure
@@ -60,14 +73,14 @@ func (pbe *PatternBlockElement) SetKey(patternBlock string) {
 }
 
 // SetValue Function (PatternBlockElement)
-func (pbe *PatternBlockElement) SetValue(mask uint32, index uint16) {
-	pbe.Value.Mask = mask
+func (pbe *PatternBlockElement) SetValue(flags uint32, index uint16) {
+	pbe.Value.Flags = flags
 	pbe.Value.Index = index
 }
 
 // SetFoundValue Function (PatternBlockElement)
 func (pbe *PatternBlockElement) SetFoundValue(value []byte) {
-	pbe.Value.Mask = uint32(getInt(value[0:4]))
+	pbe.Value.Flags = uint32(getInt(value[0:4]))
 	pbe.Value.Index = uint16(getInt(value[4:6]))
 }
 
@@ -127,102 +140,162 @@ func (pbe *PatternBlockElement) MapName() string {
 // 	return "pattern_map"
 // }
 
+// maskPatternBlockFlags Function
+func maskPatternBlockFlags(length uint8, pkind uint8, refCount uint16) uint32 {
+	return (uint32(length) << 24) | (uint32(pkind) << 16) | uint32(refCount)
+}
+
+// getPatternBlockValue Function
+func getPatternBlockValue(patternBlock string) (*PatternBlockValue, error) {
+	if patternBlock == "" {
+		return nil, errors.New("pattern block cannot be nil")
+	}
+
+	if len(patternBlock) > MaxPatternBlockLen-1 {
+		return nil, fmt.Errorf("pattern block length must be less than %v", MaxPatternBlockLen)
+	}
+
+	var plen uint8
+	var pkind uint8
+
+	plen = uint8(len(patternBlock))
+	pkind = WildRawMask
+
+	if strings.Contains(patternBlock, "*") {
+		pkind |= WildStarMask
+	}
+	if strings.Contains(patternBlock, "?") {
+		pkind |= WildQMarkMask
+	}
+
+	return &PatternBlockValue{
+		Flags: maskPatternBlockFlags(plen, pkind, 0),
+		Index: 0,
+	}, nil
+}
+
+// getInt Function
 func getInt(s []byte) uint64 {
-	var res uint64
+	var result uint64
 
 	for _, b := range s {
-		res <<= 8
-		res |= uint64(b)
-	}
-
-	return res
-}
-
-func ExitIfErr(err error) {
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
-	}
-}
-
-func getPatternProperties(pattern string) (blocks int, stars, qmarks uint64) {
-	var lastRune rune
-
-	if pattern == "" {
-		return 0, 0, 0
-	}
-
-	if pattern[0] != '/' {
-		blocks++
-	}
-
-	for _, s := range pattern {
-		if s == lastRune {
-			continue
-		} else if s == '/' {
-			blocks++
-		} else if s == '*' {
-			stars |= uint64(1 << (blocks - 1))
-		} else if s == '?' {
-			qmarks |= uint64(1 << (blocks - 1))
-		}
-
-		lastRune = s
-	}
-
-	if pattern[len(pattern)-1] == '/' {
-		blocks--
-	}
-
-	if blocks > 64 {
-		return 0, 0, 0
-	}
-
-	return blocks, stars, qmarks
-}
-
-func getPatternBlockKeys(pattern string) []PatternBlockKey {
-	if pattern == "" {
-		return nil
-	}
-
-	var blockIndexes []int
-	var lastRune rune
-	var result []PatternBlockKey
-
-	if pattern[0] != '/' {
-		blockIndexes = append(blockIndexes, 0)
-	}
-
-	for i, r := range pattern {
-		if r == lastRune {
-			continue
-		}
-		if r == '/' {
-			blockIndexes = append(blockIndexes, i)
-		}
-	}
-
-	if pattern[len(pattern)-1] != '/' {
-		blockIndexes = append(blockIndexes, len(pattern))
-	}
-
-	for i := 0; i < len(blockIndexes)-1; i++ {
-		var pbe PatternBlockElement
-		begin := blockIndexes[i]
-		end := blockIndexes[i+1]
-
-		pbe.SetKey(pattern[begin:end])
-		result = append(result, pbe.Key)
+		result <<= 8
+		result |= uint64(b)
 	}
 
 	return result
+}
+
+// ExitIfErr Function
+func ExitIfErr(err error) {
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		runtime.Goexit()
+	}
+}
+
+// getPatternBlocks Function
+func getPatternBlocks(pattern string) ([]string, error) {
+	if pattern == "" {
+		return nil, errors.New("pattern cannot be nil")
+	}
+
+	if len(pattern) > MaxPatternLen-1 {
+		return nil, fmt.Errorf("pattern length must be less than %v", MaxPatternLen)
+	}
+
+	var blockOffsets []int
+	var prevByte byte
+	var result []string
+
+	if pattern[0] != '/' {
+		blockOffsets = append(blockOffsets, 0)
+	}
+
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == prevByte {
+			continue
+		}
+		if pattern[i] == '/' {
+			blockOffsets = append(blockOffsets, i)
+		}
+	}
+	blockOffsets = append(blockOffsets, len(pattern))
+
+	for i := 0; i < len(blockOffsets)-1; i++ {
+		begin := blockOffsets[i]
+		end := blockOffsets[i+1]
+
+		if (end - begin) > (MaxPatternBlockLen - 1) {
+			return nil, fmt.Errorf("pattern block length must be less than %v", MaxPatternBlockLen)
+		}
+
+		result = append(result, pattern[begin:end])
+	}
+
+	return result, nil
+}
+
+// getPatternBlockElems Function
+func getPatternBlockElems(patternBlocks []string) ([]PatternBlockElement, error) {
+	if patternBlocks == nil {
+		return nil, errors.New("patternBlocks cannot be nil")
+	}
+
+	var result []PatternBlockElement
+	var err error
+
+	for _, pb := range patternBlocks {
+		var pbe PatternBlockElement
+		var pbv *PatternBlockValue
+
+		pbe.SetKey(pb)
+
+		if pbv, err = getPatternBlockValue(pb); err != nil {
+			return nil, err
+		}
+
+		pbe.Value = *pbv
+
+		result = append(result, pbe)
+	}
+
+	return result, nil
+}
+
+// patternClean Function
+func patternClean(pattern string) string {
+	if pattern == "" {
+		return ""
+	}
+
+	var result bytes.Buffer
+	var prevByte byte
+
+	// remove adjacent stars
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '*' && pattern[i] == prevByte {
+			continue
+		}
+		prevByte = pattern[i]
+
+		result.WriteByte(pattern[i])
+	}
+
+	return filepath.Clean(result.String())
+}
+
+// updatePatternBlockElement Function
+func updatePatternBlockElement(pbmap *lbpf.KABPFMap, elem PatternBlockElement) error {
+	return pbmap.UpdateElement(&elem)
 }
 
 func main() {
 	var err error
 	var o *lbpf.KABPFObject
 	var pbmap *lbpf.KABPFMap
+
+	defer os.Exit(0)
 
 	o, err = lbpf.OpenObjectFromFile("ebpf-pattern.bpf.o")
 	ExitIfErr(err)
@@ -238,16 +311,20 @@ func main() {
 	ExitIfErr(err)
 	defer pbmap.Unpin(pbmap.PinPath())
 
-	// pattern := "/1****/2/////3????sh/4/5/6/7****///8/9????/10/11***/"
-	pattern := "/usr/bin/??sh"
+	dirtyPattern := "/2345678901/*****/bin////??sh/l?s*"
+	cleanedPattern := patternClean(dirtyPattern)
+	fmt.Println("---")
+	fmt.Println("dirty pattern:  ", dirtyPattern)
+	fmt.Println("cleaned pattern:", cleanedPattern)
 
-	res := getPatternBlockKeys(pattern)
+	patternBlocks, err := getPatternBlocks(cleanedPattern)
+	ExitIfErr(err)
+	pbElems, err := getPatternBlockElems(patternBlocks)
+	ExitIfErr(err)
 
-	for _, r := range res {
-		var patternBlockElem PatternBlockElement
-
-		patternBlockElem.Key = r
-		err = pbmap.UpdateElement(&patternBlockElem)
+	for i, pbe := range pbElems {
+		pbe.Value.Index = uint16(i)
+		err = updatePatternBlockElement(pbmap, pbe)
 		ExitIfErr(err)
 	}
 
@@ -256,6 +333,6 @@ func main() {
 	go func() {
 		<-c
 	}()
-	fmt.Printf("\n-> Do the map tests\n")
-	fmt.Printf("\n-> Caught sig %v!\n** Thanks for venturing into this design! **", <-c)
+	fmt.Printf("\n-> Read the maps from the tale\n")
+	fmt.Printf("\n-> Caught Eru Ilúvatar %v!\n\n** Thanks for venturing into this design! **", <-c)
 }
