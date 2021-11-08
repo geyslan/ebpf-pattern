@@ -6,9 +6,12 @@ import "C"
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -31,6 +34,12 @@ const (
 	WildQMarkMask
 )
 
+var (
+	patternBlockIndex uint32
+)
+
+// ---
+
 // PatternBlockElement Structure
 type PatternBlockElement struct {
 	Key   PatternBlockKey
@@ -45,25 +54,7 @@ type PatternBlockKey struct {
 // PatternBlockValue Structure
 type PatternBlockValue struct {
 	Flags uint32
-	Index uint16
-}
-
-// PatternElement Structure
-type PatternElement struct {
-	Key   PatternKey
-	Value PatternValue
-}
-
-// PatternKey Structure
-type PatternKey struct {
-	PidNS               uint32
-	MntNS               uint32
-	PatternBlockOffsets [MaxPatternBlocks]uint16
-}
-
-// PatternValue Structure
-type PatternValue struct {
-	Raw uint16
+	Index uint32
 }
 
 // SetKey Function (PatternBlockElement)
@@ -73,15 +64,15 @@ func (pbe *PatternBlockElement) SetKey(patternBlock string) {
 }
 
 // SetValue Function (PatternBlockElement)
-func (pbe *PatternBlockElement) SetValue(flags uint32, index uint16) {
+func (pbe *PatternBlockElement) SetValue(flags uint32, index uint32) {
 	pbe.Value.Flags = flags
 	pbe.Value.Index = index
 }
 
 // SetFoundValue Function (PatternBlockElement)
 func (pbe *PatternBlockElement) SetFoundValue(value []byte) {
-	pbe.Value.Flags = uint32(getInt(value[0:4]))
-	pbe.Value.Index = uint16(getInt(value[4:6]))
+	pbe.Value.Flags = binary.LittleEndian.Uint32(value[0:4])
+	pbe.Value.Index = binary.LittleEndian.Uint32(value[4:8])
 }
 
 // KeyPointer Function (PatternBlockElement)
@@ -101,52 +92,87 @@ func (pbe *PatternBlockElement) MapName() string {
 	return "pattern_block_map"
 }
 
-// // SetKey Function (PatternElement)
-// func (pme *PatternElement) SetKey(pattern string) {
-// 	copy(pme.Key.Pattern[:PatternMaxLen], pattern)
-// 	pme.Key.Pattern[PatternMaxLen-1] = 0
-// }
+// ---- PatternElement ----
 
-// // SetValue Function (PatternElement)
-// func (pme *PatternElement) SetValue(length, blocks uint8, starsMask, qmarksMask uint64) {
-// 	pme.Value.Length = length
-// 	pme.Value.Blocks = blocks
-// 	pme.Value.StarsMask = starsMask
-// 	pme.Value.QMarksMask = qmarksMask
-// }
-
-// // SetFoundValue Function (PatternElement)
-// func (pme *PatternElement) SetFoundValue(value []byte) {
-// 	pme.Value.Length = value[0]
-// 	pme.Value.Blocks = value[1]
-// 	pme.Value.StarsMask = getInt(value[2:10])
-// 	pme.Value.QMarksMask = getInt(value[10:18])
-// }
-
-// // KeyPointer Function (PatternElement)
-// func (pme *PatternElement) KeyPointer() unsafe.Pointer {
-// 	// #nosec
-// 	return unsafe.Pointer(&pme.Key)
-// }
-
-// // ValuePointer Function (PatternElement)
-// func (pme *PatternElement) ValuePointer() unsafe.Pointer {
-// 	// #nosec
-// 	return unsafe.Pointer(&pme.Value)
-// }
-
-// // MapName Function (PatternElement)
-// func (pme *PatternElement) MapName() string {
-// 	return "pattern_map"
-// }
-
-// maskPatternBlockFlags Function
-func maskPatternBlockFlags(length uint8, pkind uint8, refCount uint16) uint32 {
-	return (uint32(length) << 24) | (uint32(pkind) << 16) | uint32(refCount)
+// PatternElement Structure
+type PatternElement struct {
+	Key   PatternKey
+	Value PatternValue
 }
 
-// getPatternBlockValue Function
-func getPatternBlockValue(patternBlock string) (*PatternBlockValue, error) {
+// PatternKey Structure
+type PatternKey struct {
+	PidNS               uint32
+	MntNS               uint32
+	PatternBlockIndexes [MaxPatternBlocks]uint32
+}
+
+// PatternValue Structure
+type PatternValue struct {
+	Flags uint16
+}
+
+// SetKey Function (PatternElement)
+func (pe *PatternElement) SetKey(pidNS, mntNS uint32, blockOffsets [MaxPatternBlocks]uint32) {
+	pe.Key.PidNS = pidNS
+	pe.Key.MntNS = mntNS
+	pe.Key.PatternBlockIndexes = blockOffsets
+}
+
+// SetValue Function (PatternElement)
+func (pe *PatternElement) SetValue(flags uint16) {
+	pe.Value.Flags = flags
+}
+
+// SetFoundValue Function (PatternElement)
+func (pe *PatternElement) SetFoundValue(value []byte) {
+	pe.Value.Flags = binary.LittleEndian.Uint16(value)
+}
+
+// KeyPointer Function (PatternElement)
+func (pe *PatternElement) KeyPointer() unsafe.Pointer {
+	// #nosec
+	return unsafe.Pointer(&pe.Key)
+}
+
+// ValuePointer Function (PatternElement)
+func (pe *PatternElement) ValuePointer() unsafe.Pointer {
+	// #nosec
+	return unsafe.Pointer(&pe.Value)
+}
+
+// MapName Function (PatternElement)
+func (pe *PatternElement) MapName() string {
+	return "pattern_map"
+}
+
+// setPatternBlockFlags Function
+func setPatternBlockFlags(length uint8, kind uint8, refCount uint16) uint32 {
+	return (uint32(length) << 24) | (uint32(kind) << 16) | uint32(refCount)
+}
+
+func getPatternBlockRefCountFlag(flags uint32) uint16 {
+	return uint16(flags)
+}
+
+func incPatternBlockRefCountFlag(flags uint32) (uint32, error) {
+	if getPatternBlockRefCountFlag(flags) == math.MaxUint16 {
+		return math.MaxUint16, fmt.Errorf("max reference count: %v", math.MaxUint16)
+	}
+
+	return flags + 1, nil
+}
+
+func decPatternBlockRefCountFlag(flags uint32) (uint32, error) {
+	if getPatternBlockRefCountFlag(flags) == 0 {
+		return 0, errors.New("min reference count: 0")
+	}
+
+	return flags - 1, nil
+}
+
+// calcPatternBlockValue Function
+func calcPatternBlockValue(patternBlock string) (*PatternBlockValue, error) {
 	if patternBlock == "" {
 		return nil, errors.New("pattern block cannot be nil")
 	}
@@ -169,7 +195,7 @@ func getPatternBlockValue(patternBlock string) (*PatternBlockValue, error) {
 	}
 
 	return &PatternBlockValue{
-		Flags: maskPatternBlockFlags(plen, pkind, 0),
+		Flags: setPatternBlockFlags(plen, pkind, 0),
 		Index: 0,
 	}, nil
 }
@@ -189,7 +215,9 @@ func getInt(s []byte) uint64 {
 // ExitIfErr Function
 func ExitIfErr(err error) {
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
+		fmt.Fprintln(os.Stderr, "ERROR:", err.Error())
+		fmt.Fprintf(os.Stderr, "\n- Instead of throwing the ring, you threw yourself into the Mount Doom.")
+		fmt.Fprintf(os.Stderr, "\n- If you are a Maiar, try again.\n")
 		runtime.Goexit()
 	}
 }
@@ -236,31 +264,67 @@ func getPatternBlocks(pattern string) ([]string, error) {
 	return result, nil
 }
 
-// getPatternBlockElems Function
-func getPatternBlockElems(patternBlocks []string) ([]PatternBlockElement, error) {
-	if patternBlocks == nil {
-		return nil, errors.New("patternBlocks cannot be nil")
+// buildAndUpdatePatternBlockElems Function
+func buildAndUpdatePatternBlockElems(pbmap *lbpf.KABPFMap, pBlocks []string) ([]PatternBlockElement, error) {
+	if pBlocks == nil {
+		return nil, errors.New("pBlocks cannot be nil")
 	}
 
 	var result []PatternBlockElement
+	var val []byte
 	var err error
 
-	for _, pb := range patternBlocks {
+	for _, pb := range pBlocks {
 		var pbe PatternBlockElement
 		var pbv *PatternBlockValue
 
 		pbe.SetKey(pb)
-
-		if pbv, err = getPatternBlockValue(pb); err != nil {
-			return nil, err
+		val, _ = pbmap.LookupElement(&pbe)
+		if val == nil {
+			if pbv, err = calcPatternBlockValue(pb); err != nil {
+				return nil, err
+			}
+			pbe.Value = *pbv
+			pbe.Value.Index = getPatternBlockAvailableIndex()
+			err = updatePatternBlockElement(pbmap, pbe)
+			ExitIfErr(err)
+			incPatternBlockAvailableIndex()
 		}
-
-		pbe.Value = *pbv
 
 		result = append(result, pbe)
 	}
 
 	return result, nil
+}
+
+func buildAndUpdatePatternElem(pmap *lbpf.KABPFMap, pBlocksElems []PatternBlockElement) (*PatternElement, error) {
+	if pBlocksElems == nil {
+		return nil, errors.New("pBlocksElems cannot be nil")
+	}
+
+	if len(pBlocksElems) > MaxPatternBlocks {
+		return nil, fmt.Errorf("pattern must has up to %v blocks", MaxPatternBlocks)
+	}
+
+	var pe PatternElement
+	var err error
+
+	output, _ := exec.Command("readlink", "/proc/self/ns/pid").Output()
+	fmt.Sscanf(string(output), "pid:[%d]\n", &pe.Key.PidNS)
+	output, _ = exec.Command("readlink", "/proc/self/ns/mnt").Output()
+	fmt.Sscanf(string(output), "mnt:[%d]\n", &pe.Key.MntNS)
+
+	for i, pbe := range pBlocksElems {
+		pe.Key.PatternBlockIndexes[i] = pbe.Value.Index
+	}
+
+	pe.Value.Flags = 0
+
+	if err = pmap.UpdateElement(&pe); err != nil {
+		return nil, err
+	}
+
+	return &pe, nil
 }
 
 // patternClean Function
@@ -290,10 +354,38 @@ func updatePatternBlockElement(pbmap *lbpf.KABPFMap, elem PatternBlockElement) e
 	return pbmap.UpdateElement(&elem)
 }
 
+// getPatternBlockAvailableIndex Function
+func getPatternBlockAvailableIndex() uint32 {
+	return patternBlockIndex + 1
+}
+
+// incPatternBlockAvailableIndex Function
+func incPatternBlockAvailableIndex() {
+	patternBlockIndex++
+}
+
+func insertPattern(pbmap, pmap *lbpf.KABPFMap, pattern string) {
+	cleanedPattern := patternClean(pattern)
+	fmt.Println("---")
+	fmt.Println("dirty pattern:  ", pattern)
+	fmt.Println("cleaned pattern:", cleanedPattern)
+	fmt.Println("---")
+
+	pBlocks, err := getPatternBlocks(cleanedPattern)
+	ExitIfErr(err)
+	pbElems, err := buildAndUpdatePatternBlockElems(pbmap, pBlocks)
+	ExitIfErr(err)
+
+	_, err = buildAndUpdatePatternElem(pmap, pbElems)
+	ExitIfErr(err)
+}
+
 func main() {
 	var err error
 	var o *lbpf.KABPFObject
 	var pbmap *lbpf.KABPFMap
+	var pmap *lbpf.KABPFMap
+	var prog *lbpf.KABPFProgram
 
 	defer os.Exit(0)
 
@@ -304,6 +396,12 @@ func main() {
 	ExitIfErr(err)
 	defer o.Close()
 
+	prog, err = o.FindProgramByName("sched_process_exec")
+	ExitIfErr(err)
+
+	_, err = prog.AttachTracepoint("sched", "sched_process_exec")
+	ExitIfErr(err)
+
 	pbmap, err = o.FindMapByName("pattern_block_map")
 	ExitIfErr(err)
 
@@ -311,28 +409,23 @@ func main() {
 	ExitIfErr(err)
 	defer pbmap.Unpin(pbmap.PinPath())
 
-	dirtyPattern := "/2345678901/*****/bin////??sh/l?s*"
-	cleanedPattern := patternClean(dirtyPattern)
-	fmt.Println("---")
-	fmt.Println("dirty pattern:  ", dirtyPattern)
-	fmt.Println("cleaned pattern:", cleanedPattern)
-
-	patternBlocks, err := getPatternBlocks(cleanedPattern)
-	ExitIfErr(err)
-	pbElems, err := getPatternBlockElems(patternBlocks)
+	pmap, err = o.FindMapByName("pattern_map")
 	ExitIfErr(err)
 
-	for i, pbe := range pbElems {
-		pbe.Value.Index = uint16(i)
-		err = updatePatternBlockElement(pbmap, pbe)
-		ExitIfErr(err)
-	}
+	err = pmap.Pin("/sys/fs/bpf/" + pmap.Name())
+	ExitIfErr(err)
+	defer pmap.Unpin(pmap.PinPath())
+
+	insertPattern(pbmap, pmap, "/???/bin///**sh")
+	insertPattern(pbmap, pmap, "////***r/bin/??sh")
+	insertPattern(pbmap, pmap, "////???/??n/ls")
+	//insertPattern(pbmap, pmap, "/1/2/3/4/5/6/7/8/9/0/1/2")
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		<-c
 	}()
-	fmt.Printf("\n-> Read the maps from the tale\n")
-	fmt.Printf("\n-> Caught Eru Ilúvatar %v!\n\n** Thanks for venturing into this design! **", <-c)
+	fmt.Printf("\n- Sam, don't you think we should check some map?\n")
+	fmt.Printf("\n- Caught Eru Ilúvatar %v!\n\n** Thanks for venturing into this design! **", <-c)
 }

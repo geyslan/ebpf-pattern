@@ -1,5 +1,5 @@
 #define TASK_COMM_LEN	      16
 #define MAX_FILENAME_LEN      64
-#define MAX_PATTERN_LEN	      64
+#define MAX_PATTERN_LEN	      MAX_FILENAME_LEN
 #define MAX_PATTERN_BLOCK_LEN 12
 #define MAX_PATTERN_BLOCKS    6
