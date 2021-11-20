@@ -10,12 +10,12 @@
 /* === */
 
 struct pattern_block_key {
-	char pattern_block[MAX_PATTERN_BLOCK_LEN];
+	u32 index; /* limited to refcount (u16), it's u32 just for alignment */
 };
 
 struct pattern_block_value {
-	u32 flags; /* (length << 24) | (kind << 16) | (u16) refcount */
-	u32 index; /* limited to refcount (u16), it's u32 just for alignment */
+	char pattern_block[MAX_PATTERN_BLOCK_LEN];
+	u32  flags; /* (length << 24) | (kind << 16) | (u16) refcount */
 };
 
 struct pattern_key {
@@ -121,17 +121,16 @@ task_get_ids(struct current_task *ctask)
 
 /* callback_ctx struct is used as check_hash_elem handler input/output */
 struct callback_ctx {
-	const char *filename;
+	const char	   *filename;
 	struct pattern_value *pvalue;
 };
 
 /* check_hash_elem is the handler required by bpf_for_each_map_elem iterator */
-static
-u64 check_hash_elem(struct bpf_map *map,
-		    struct pattern_key *key, struct pattern_value *val,
-		    struct callback_ctx *data)
+static u64
+check_hash_elem(struct bpf_map *map, struct pattern_key *pkey,
+		struct pattern_value *pval, struct callback_ctx *data)
 {
-	if (!key || !val || !data)
+	if (!pkey || !pval || !data)
 		return 0;
 
 	// if (match(key->pattern, data->filename)) {
@@ -139,11 +138,70 @@ u64 check_hash_elem(struct bpf_map *map,
 	// 	return 1; // stop the iteration
 	// }
 
-	for (int i = 0; i < MAX_PATTERN_BLOCKS; i++)
-		bpf_printk("block %u\n", key->pattern_block_indexes[i]);
+	struct pattern_block_value *pbvalue;
 
+	for (int i = 0; i < MAX_PATTERN_BLOCKS; i++) {
+		pbvalue = bpf_map_lookup_elem(&pattern_block_map,
+					      &pkey->pattern_block_indexes[i]);
+		if (!pbvalue)
+			return 0;
+
+		// if (pval->flags != pblen) {
+		// //
+		// }
+
+		// if (match(pvalue, data->))
+		// bpf_printk("block %u\n", key->pattern_block_indexes[i]);
+	}
 
 	return 0;
+}
+
+/* strlen determines the length of a fixed-size string */
+static size_t
+strnlen(const char *str, size_t maxlen)
+{
+	if (!str || !maxlen)
+		return 0;
+
+	if (maxlen == __SIZE_MAX__)
+		maxlen--;
+
+	size_t i = 0;
+
+	while (i < maxlen && str[i])
+		i++;
+
+	return i;
+}
+
+struct filename_blocks {
+	char blocks[MAX_PATTERN_BLOCKS][MAX_PATTERN_BLOCK_LEN];
+	u16  length;
+};
+
+static void
+fill_filename_blocks(struct filename_blocks    *fnblocks,
+		     const struct current_task *ctask)
+{
+	size_t len = strnlen(ctask->filename, MAX_FILENAME_LEN);
+	int    block_offsets[MAX_PATTERN_BLOCKS + 1] = {};
+	int    index				     = 0;
+
+	for (int i = 0; i < len; i++) {
+		if (ctask->filename[i] == '/') {
+			block_offsets[index] = i;
+			bpf_printk("test1: %d", block_offsets[index]);
+			index++;
+			if (index >= MAX_PATTERN_BLOCKS + 1)
+				break;
+		}
+	}
+
+	for (int i = 0; i < MAX_PATTERN_BLOCKS; i++) {
+		for (int j = 0; j < MAX_PATTERN_BLOCK_LEN; j++)
+			fnblocks->blocks[i][j] = ctask->filename[i + j];
+	}
 }
 
 /* task_auditable checks if task must be audited */
@@ -154,14 +212,19 @@ task_auditable(const struct current_task *ctask)
 		return false;
 
 	/* pblocks = get_pattern_blocks(ctask->filename); */
-/* 	for (int i = 0; i < MAX_PATTERN_BLOCKS; i++) {
-		pbvalue = bpf_map_lookup_elem(&pattern_map, pblocks[i]);
+	/* 	for (int i = 0; i < MAX_PATTERN_BLOCKS; i++) {
+			pbvalue = bpf_map_lookup_elem(&pattern_map, pblocks[i]);
 
-		if (!pbvalue) {
-			// 
-		}
-		// do stuff
-	} */
+			if (!pbvalue) {
+				//
+			}
+			// do stuff
+		} */
+
+	struct filename_blocks fnblocks;
+
+	fill_filename_blocks(&fnblocks, ctask);
+	bpf_printk("test: %s", fnblocks.blocks);
 
 	struct pattern_value pvalue = {
 		.flags = 0,
@@ -172,16 +235,14 @@ task_auditable(const struct current_task *ctask)
 	};
 
 	// https://lwn.net/Articles/846504/
-	long elem_num = bpf_for_each_map_elem(&pattern_map,
-					      check_hash_elem, &data, 0);
+	long elem_num =
+		bpf_for_each_map_elem(&pattern_map, check_hash_elem, &data, 0);
 	if (elem_num < 0)
 		return false;
 
-	//pattern_id = data.pvalue->pattern_id;
+	// pattern_id = data.pvalue->pattern_id;
 
 	return true;
-
-
 
 	// struct pattern_key    pkey;
 	// struct pattern_value *palue;
@@ -189,9 +250,8 @@ task_auditable(const struct current_task *ctask)
 	// pkey.pidns
 
 	// 	fnkey.hash = ctask->filename_hash;
-	// fnvalue		   = bpf_map_lookup_elem(&ka_ea_filename_map, &fnkey);
-	// if (!fnvalue)
-	// 	return false;
+	// fnvalue		   = bpf_map_lookup_elem(&ka_ea_filename_map,
+	// &fnkey); if (!fnvalue) 	return false;
 
 	// struct process_spec_key pskey = {
 	// 	.pid_ns	       = ctask->pid_ns,

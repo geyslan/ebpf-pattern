@@ -38,6 +38,9 @@ var (
 	patternBlockIndex uint32
 )
 
+// PatternBlockMap [patternBlock]index
+var PatternBlockMap map[string]uint32
+
 // ---
 
 // PatternBlockElement Structure
@@ -48,31 +51,30 @@ type PatternBlockElement struct {
 
 // PatternBlockKey Structure
 type PatternBlockKey struct {
-	PatternBlock [MaxPatternBlockLen]byte
+	Index uint32
 }
 
 // PatternBlockValue Structure
 type PatternBlockValue struct {
-	Flags uint32
-	Index uint32
+	PatternBlock [MaxPatternBlockLen]byte
+	Flags        uint32
 }
 
 // SetKey Function (PatternBlockElement)
-func (pbe *PatternBlockElement) SetKey(patternBlock string) {
-	copy(pbe.Key.PatternBlock[:MaxPatternBlockLen], patternBlock)
-	pbe.Key.PatternBlock[MaxPatternBlockLen-1] = 0
+func (pbe *PatternBlockElement) SetKey(index uint32) {
+	pbe.Key.Index = index
 }
 
 // SetValue Function (PatternBlockElement)
-func (pbe *PatternBlockElement) SetValue(flags uint32, index uint32) {
+func (pbe *PatternBlockElement) SetValue(patternBlock string, flags uint32) {
+	pbe.Value.PatternBlock = getPatternBlock(patternBlock)
 	pbe.Value.Flags = flags
-	pbe.Value.Index = index
 }
 
 // SetFoundValue Function (PatternBlockElement)
 func (pbe *PatternBlockElement) SetFoundValue(value []byte) {
-	pbe.Value.Flags = binary.LittleEndian.Uint32(value[0:4])
-	pbe.Value.Index = binary.LittleEndian.Uint32(value[4:8])
+	pbe.Value.PatternBlock = getPatternBlock(string(value[0:MaxPatternBlockLen]))
+	pbe.Value.Flags = binary.LittleEndian.Uint32(value[MaxPatternBlockLen : MaxPatternBlockLen+4])
 }
 
 // KeyPointer Function (PatternBlockElement)
@@ -146,8 +148,8 @@ func (pe *PatternElement) MapName() string {
 	return "pattern_map"
 }
 
-// setPatternBlockFlags Function
-func setPatternBlockFlags(length uint8, kind uint8, refCount uint16) uint32 {
+// getPatternBlockFlags Function
+func getPatternBlockFlags(length uint8, kind uint8, refCount uint16) uint32 {
 	return (uint32(length) << 24) | (uint32(kind) << 16) | uint32(refCount)
 }
 
@@ -169,6 +171,15 @@ func decPatternBlockRefCountFlag(flags uint32) (uint32, error) {
 	}
 
 	return flags - 1, nil
+}
+
+func getPatternBlock(patternBlock string) [MaxPatternBlockLen]byte {
+	var pb [MaxPatternBlockLen]byte
+
+	copy(pb[:MaxPatternBlockLen], patternBlock)
+	pb[MaxPatternBlockLen-1] = 0
+
+	return pb
 }
 
 // calcPatternBlockValue Function
@@ -195,8 +206,8 @@ func calcPatternBlockValue(patternBlock string) (*PatternBlockValue, error) {
 	}
 
 	return &PatternBlockValue{
-		Flags: setPatternBlockFlags(plen, pkind, 0),
-		Index: 0,
+		PatternBlock: getPatternBlock(patternBlock),
+		Flags:        getPatternBlockFlags(plen, pkind, 1),
 	}, nil
 }
 
@@ -274,21 +285,37 @@ func buildAndUpdatePatternBlockElems(pbmap *lbpf.KABPFMap, pBlocks []string) ([]
 	var val []byte
 	var err error
 
+	if PatternBlockMap == nil {
+		PatternBlockMap = make(map[string]uint32)
+	}
+
 	for _, pb := range pBlocks {
 		var pbe PatternBlockElement
 		var pbv *PatternBlockValue
 
-		pbe.SetKey(pb)
-		val, _ = pbmap.LookupElement(&pbe)
-		if val == nil {
+		if index, found := PatternBlockMap[pb]; found {
+			pbe.Key.Index = index
+			val, _ = pbmap.LookupElement(&pbe)
+			if val != nil {
+				flags, err := incPatternBlockRefCountFlag(pbe.Value.Flags)
+				ExitIfErr(err)
+				pbe.Value.Flags = flags
+
+				err = updatePatternBlockElement(pbmap, pbe)
+				ExitIfErr(err)
+			}
+		} else {
 			if pbv, err = calcPatternBlockValue(pb); err != nil {
 				return nil, err
 			}
+			pbe.Key.Index = getPatternBlockAvailableIndex()
 			pbe.Value = *pbv
-			pbe.Value.Index = getPatternBlockAvailableIndex()
+
 			err = updatePatternBlockElement(pbmap, pbe)
 			ExitIfErr(err)
 			incPatternBlockAvailableIndex()
+
+			PatternBlockMap[pb] = pbe.Key.Index
 		}
 
 		result = append(result, pbe)
@@ -315,10 +342,10 @@ func buildAndUpdatePatternElem(pmap *lbpf.KABPFMap, pBlocksElems []PatternBlockE
 	fmt.Sscanf(string(output), "mnt:[%d]\n", &pe.Key.MntNS)
 
 	for i, pbe := range pBlocksElems {
-		pe.Key.PatternBlockIndexes[i] = pbe.Value.Index
+		pe.Key.PatternBlockIndexes[i] = pbe.Key.Index
 	}
 
-	pe.Value.Flags = 0
+	pe.Value.Flags = uint16(len(pBlocksElems))
 
 	if err = pmap.UpdateElement(&pe); err != nil {
 		return nil, err
